@@ -112,7 +112,7 @@ export function createTimelineController(input: { session: TimelineSessionSource
         (item.type === "user" &&
           item.delivery === "steer" &&
           data.session.pending.status(id, item.id) !== "starting") ||
-        item.type === "synthetic"
+        (item.type === "synthetic" && item.delivery === "steer")
           ? [item.id]
           : [],
       ),

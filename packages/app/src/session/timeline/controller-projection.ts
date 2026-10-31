@@ -68,12 +68,14 @@ export function visibleTimelineMessages(
   revertMessageID?: string,
 ) {
   const queued = new Set(
-    pending.flatMap((item) => (item.type === "user" && item.delivery === "queue" ? [item.id] : [])),
+    pending.flatMap((item) =>
+      (item.type === "user" || item.type === "synthetic") && item.delivery === "queue" ? [item.id] : [],
+    ),
   )
 
   const inputs = new Set(
     pending.flatMap((item) =>
-      (item.type === "user" && item.delivery === "steer") || item.type === "synthetic" ? [item.id] : [],
+      (item.type === "user" || item.type === "synthetic") && item.delivery === "steer" ? [item.id] : [],
     ),
   )
 

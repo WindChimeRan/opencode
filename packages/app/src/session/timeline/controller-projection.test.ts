@@ -167,9 +167,26 @@ describe("visibleTimelineMessages", () => {
         delivery: "queue",
         payload: { text: "queued" },
       },
+      {
+        id: "msg_4a",
+        sessionID: "ses_1",
+        time: { created: 4 },
+        type: "synthetic",
+        delivery: "queue",
+        payload: { text: "scheduled wake", description: "Scheduled prompt" },
+      },
     ] satisfies SessionInboxInfo[]
 
-    expect(visibleTimelineMessages(messages, pending).map((message) => message.id)).toEqual(["msg_1", "msg_2", "msg_4"])
+    const withNotice = [
+      ...messages,
+      { id: "msg_4a", type: "synthetic", text: "scheduled wake", description: "Scheduled prompt", time: { created: 4 } },
+    ] satisfies SessionMessageInfo[]
+
+    expect(visibleTimelineMessages(withNotice, pending).map((message) => message.id)).toEqual([
+      "msg_1",
+      "msg_2",
+      "msg_4",
+    ])
   })
 
   test("hides the staged revert boundary and later messages", () => {

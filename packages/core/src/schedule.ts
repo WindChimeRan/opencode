@@ -21,6 +21,7 @@ import { Node, makeGlobalNode } from "@opencode/util/effect/app-node"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import {
   Action,
+  Attention,
   Condition,
   ConditionInput,
   CreateInput,
@@ -32,6 +33,10 @@ import {
   Outcome,
   parseRequest,
   Request,
+  ResultInput,
+  Run,
+  RunID,
+  RunStatus,
   Status,
   type StoredCheck,
   Target,
@@ -53,10 +58,12 @@ import { SessionSchema } from "./session/schema.js"
 import { SessionInboxTable, SessionMessageTable } from "./session/sql.js"
 import { ScheduleAction } from "./schedule/action.js"
 import { ScheduleCheck } from "./schedule/check.js"
+import { ScheduleRuns } from "./schedule/runs.js"
 import { ScheduleTable } from "./schedule/sql.js"
 
 export {
   Action,
+  Attention,
   Condition,
   ConditionInput,
   CreateInput,
@@ -66,6 +73,10 @@ export {
   Outcome,
   parseRequest,
   Request,
+  ResultInput,
+  Run,
+  RunID,
+  RunStatus,
   Status,
   Target,
   Thread,
@@ -78,6 +89,14 @@ export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Schedule
 }) {
   override get message() {
     return `Schedule not found: ${this.scheduleID}`
+  }
+}
+
+export class RunNotFoundError extends Schema.TaggedError<RunNotFoundError>()("Schedule.RunNotFoundError", {
+  runID: RunID,
+}) {
+  override get message() {
+    return `Schedule run not found: ${this.runID}`
   }
 }
 
@@ -113,6 +132,19 @@ export interface Interface {
   readonly pause: (id: ID) => Effect.Effect<Info, NotFoundError>
   readonly resume: (id: ID) => Effect.Effect<Info, NotFoundError>
   readonly remove: (id: ID) => Effect.Effect<void, NotFoundError>
+  readonly runs: (input?: {
+    readonly scheduleID?: ID
+    readonly sessionID?: SessionSchema.ID
+    readonly limit?: number
+  }) => Effect.Effect<Run[]>
+  readonly inbox: (input?: {
+    readonly sessionID?: SessionSchema.ID
+    readonly includeRead?: boolean
+    readonly limit?: number
+  }) => Effect.Effect<Run[]>
+  readonly getRun: (runID: RunID) => Effect.Effect<Run, RunNotFoundError>
+  readonly markRead: (runID: RunID) => Effect.Effect<Run, RunNotFoundError>
+  readonly reportResult: (sessionID: SessionSchema.ID, input: ResultInput) => Effect.Effect<Run, InvalidError>
   /** Whether experimental.schedules is on in the config where the Session lives. */
   readonly enabled: (sessionID: SessionSchema.ID) => Effect.Effect<boolean, Session.NotFoundError>
   /** Fires every schedule that is due now, at most once each. */
@@ -225,13 +257,15 @@ const wakeDescription = (row: Pick<Row, "name" | "when" | "check" | "action">, r
 const formatCompletionNotice = (
   row: Pick<Row, "id" | "name" | "action">,
   run: number,
-  state: "completed" | "error",
+  state: "completed" | "needs_you" | "error",
   body: string,
   targetSessionID?: SessionSchema.ID,
   pausedStrikes?: number,
+  runID?: RunID,
 ) => {
   const attrs = [
     `id="${row.id}"`,
+    ...(runID ? [`runID="${runID}"`] : []),
     ...(row.name ? [`name=${JSON.stringify(row.name)}`] : []),
     `run="${run}"`,
     `action="${row.action.type}"`,
@@ -444,6 +478,7 @@ const layer = Layer.effect(
     const observeBackgroundRun = Effect.fnUntraced(function* (input: {
       readonly row: Row
       readonly ownerSessionID: SessionSchema.ID
+      readonly runID: RunID
       readonly jobID: string
       readonly run: number
       readonly due: number
@@ -462,6 +497,7 @@ const layer = Layer.effect(
       if (current === undefined) return
       const jobMatch = and(eq(ScheduleTable.id, input.row.id), eq(ScheduleTable.active_job_id, input.jobID))
       if (!info || info.status === "cancelled") {
+        yield* ScheduleRuns.cancelRun(db, input.runID, finishedAt)
         yield* db
           .update(ScheduleTable)
           .set({ active_job_id: null, time_updated: finishedAt })
@@ -475,8 +511,16 @@ const layer = Layer.effect(
       if (info.status === "error") {
         const strikes = current.failures + 1
         const autoPause = strikes >= MAX_FAILURES
+        const errorMessage = info.error ?? "Scheduled action failed"
+        yield* ScheduleRuns.settleFailed(db, {
+          runID: input.runID,
+          error: errorMessage,
+          deliver,
+          autoPause,
+          now: finishedAt,
+        })
         const noticeID =
-          deliver !== "silent" || autoPause
+          deliver === "session" || autoPause
             ? yield* admitWake(
                 input.row,
                 input.ownerSessionID,
@@ -487,9 +531,10 @@ const layer = Layer.effect(
                   input.row,
                   input.run,
                   "error",
-                  info.error ?? "Scheduled action failed",
+                  errorMessage,
                   input.targetSessionID,
                   autoPause ? strikes : undefined,
+                  input.runID,
                 ),
                 {
                   id: SessionMessage.ID.make(`msg_${input.row.id}_${input.run}_done`),
@@ -497,6 +542,7 @@ const layer = Layer.effect(
                   ...(input.checkMessage === undefined ? {} : { check: { message: input.checkMessage } }),
                   extra: {
                     state: "error",
+                    runID: input.runID,
                     ...(input.targetSessionID === undefined ? {} : { sessionID: input.targetSessionID }),
                   },
                 },
@@ -524,37 +570,80 @@ const layer = Layer.effect(
       }
 
       const output = (info.output ?? "").trim()
-      const quiet = ScheduleAction.isQuietOutput(output)
+      const settled = yield* ScheduleRuns.settleCompleted(db, {
+        runID: input.runID,
+        fallbackOutput: output,
+        deliver,
+        now: finishedAt,
+      })
+      const attention = settled?.run.attention ?? (ScheduleAction.isQuietOutput(output) ? "quiet" : "ready")
+      const body = settled?.run.summary ?? output
+      const state = attention === "needs_you" ? "needs_you" : "completed"
       const noticeID =
-        !quiet && deliver !== "silent"
+        attention !== "quiet" && deliver === "session"
           ? yield* admitWake(
               input.row,
               input.ownerSessionID,
               input.run,
               input.due,
               input.late,
-              formatCompletionNotice(input.row, input.run, "completed", output, input.targetSessionID),
+              formatCompletionNotice(
+                input.row,
+                input.run,
+                state,
+                body,
+                input.targetSessionID,
+                undefined,
+                input.runID,
+              ),
               {
                 id: SessionMessage.ID.make(`msg_${input.row.id}_${input.run}_done`),
+                ...(attention === "needs_you" ? { suffix: "needs you" } : {}),
                 ...(input.checkMessage === undefined ? {} : { check: { message: input.checkMessage } }),
                 extra: {
-                  state: "completed",
+                  state,
+                  runID: input.runID,
                   ...(input.targetSessionID === undefined ? {} : { sessionID: input.targetSessionID }),
                 },
               },
             ).pipe(Effect.catchTag("Session.NotFoundError", () => Effect.succeed(undefined)))
           : undefined
+      const latest = yield* db
+        .select({ status: ScheduleTable.status, endsAt: ScheduleTable.ends_at })
+        .from(ScheduleTable)
+        .where(jobMatch)
+        .get()
+        .pipe(Effect.orDie)
+      const adaptivePatch = (() => {
+        if (settled?.nextInMs == null || latest?.status !== "active") return {}
+        const adaptiveDue = finishedAt + settled.nextInMs
+        if (latest.endsAt !== null && adaptiveDue > latest.endsAt) {
+          return {
+            status: sql<Status>`case when ${ScheduleTable.status} = 'active' then 'done' else ${ScheduleTable.status} end`,
+            next_due_at: sql<number | null>`case when ${ScheduleTable.status} = 'active' then null else ${ScheduleTable.next_due_at} end`,
+          }
+        }
+        return {
+          next_due_at: sql<number | null>`case when ${ScheduleTable.status} = 'active' then ${adaptiveDue} else ${ScheduleTable.next_due_at} end`,
+          wake: true as const,
+        }
+      })()
       yield* db
         .update(ScheduleTable)
         .set({
           active_job_id: null,
           failures: 0,
+          ...("status" in adaptivePatch ? { status: adaptivePatch.status } : {}),
+          ...("next_due_at" in adaptivePatch ? { next_due_at: adaptivePatch.next_due_at } : {}),
           ...(noticeID === undefined ? {} : { last_message_id: noticeID }),
           time_updated: finishedAt,
         })
         .where(jobMatch)
         .run()
         .pipe(Effect.orDie)
+      if ("wake" in adaptivePatch) {
+        yield* doorbell.open
+      }
     })
 
     const dispatchAction = Effect.fnUntraced(function* (
@@ -625,6 +714,18 @@ const layer = Layer.effect(
           .where(eq(ScheduleTable.id, row.id))
           .run()
           .pipe(Effect.orDie)
+        yield* ScheduleRuns.recordCompleted(db, {
+          scheduleID: row.id,
+          scheduleName: row.name,
+          ownerSessionID: session.id,
+          sessionID: session.id,
+          run,
+          status: "completed",
+          attention: "quiet",
+          summary: ScheduleAction.summaryText(row.action),
+          read: true,
+          now,
+        })
         return
       }
 
@@ -656,6 +757,14 @@ const layer = Layer.effect(
           : undefined
       const targetSessionID = dedicated?.id ?? child?.id
       const jobID = `job_${row.id}_${run}`
+      const startedRun = yield* ScheduleRuns.startRun(db, {
+        scheduleID: row.id,
+        scheduleName: row.name,
+        ownerSessionID: session.id,
+        sessionID: targetSessionID,
+        run,
+        now,
+      })
 
       yield* db
         .update(ScheduleTable)
@@ -684,7 +793,7 @@ const layer = Layer.effect(
             return Effect.gen(function* () {
               const target = child!
               const instruction = [
-                "You are a scheduled background subagent. Complete the task autonomously without asking interactive questions. If there is nothing worth reporting, reply with NO_REPLY.",
+                'You are a scheduled background subagent. Complete the task autonomously without asking interactive questions. Call schedule_result to report your outcome (attention: "quiet", "ready", or "needs_you"), or reply with NO_REPLY if there is nothing worth reporting.',
                 promptText(action.prompt, checkMessage),
               ].join("\n\n")
               yield* sessions.prompt({
@@ -765,6 +874,7 @@ const layer = Layer.effect(
           ...(dedicated === undefined ? {} : { dedicated_session_id: dedicated.id }),
         },
         ownerSessionID: session.id,
+        runID: startedRun.id,
         jobID,
         run,
         due,
@@ -833,6 +943,18 @@ const layer = Layer.effect(
             .where(eq(ScheduleTable.id, row.id))
             .run()
             .pipe(Effect.orDie)
+          yield* ScheduleRuns.recordCompleted(db, {
+            scheduleID: row.id,
+            scheduleName: row.name,
+            ownerSessionID: session.id,
+            sessionID: session.id,
+            run,
+            status: "failed",
+            attention: "needs_you",
+            summary: note,
+            error: outcome.error,
+            now,
+          })
           return
         }
 
@@ -841,13 +963,14 @@ const layer = Layer.effect(
           const ended = next === undefined || (row.ends_at !== null && next > row.ends_at)
           if (check.mode === "until" && ended) {
             const run = row.run_count + 1
+            const timeoutNote = `[Schedule timed out without matching: ${ScheduleCheck.describe(check.condition)}]`
             const id = yield* admitWake(
               row,
               session.id,
               run,
               due,
               late,
-              `${ScheduleAction.summaryText(row.action)}\n\n[Schedule timed out without matching: ${ScheduleCheck.describe(check.condition)}]`,
+              `${ScheduleAction.summaryText(row.action)}\n\n${timeoutNote}`,
               { suffix: "timed out", check: { expired: true } },
             )
             yield* db
@@ -869,6 +992,17 @@ const layer = Layer.effect(
               .where(eq(ScheduleTable.id, row.id))
               .run()
               .pipe(Effect.orDie)
+            yield* ScheduleRuns.recordCompleted(db, {
+              scheduleID: row.id,
+              scheduleName: row.name,
+              ownerSessionID: session.id,
+              sessionID: session.id,
+              run,
+              status: "completed",
+              attention: "needs_you",
+              summary: timeoutNote,
+              now,
+            })
             return
           }
           yield* update(row, {
@@ -1000,18 +1134,22 @@ const layer = Layer.effect(
     // A crash between admitting a prompt and its Session claiming the work leaves the prompt unclaimed and the
     // Session asleep, so wake every Session whose last scheduled prompt is still pending and clear stale job IDs.
     const rewake = Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis
       const tracked = yield* db
         .select({ id: ScheduleTable.id, activeJobID: ScheduleTable.active_job_id })
         .from(ScheduleTable)
         .where(isNotNull(ScheduleTable.active_job_id))
         .all()
         .pipe(Effect.orDie)
+      const liveIDs: ID[] = []
       const staleIDs: ID[] = []
       for (const item of tracked) {
         if (item.activeJobID === null) continue
         const live = yield* jobs.get(item.activeJobID)
-        if (live?.status !== "running") staleIDs.push(item.id)
+        if (live?.status === "running") liveIDs.push(item.id)
+        else staleIDs.push(item.id)
       }
+      yield* ScheduleRuns.clearOrphanedRunning(db, now, liveIDs)
       if (staleIDs.length > 0) {
         yield* db
           .update(ScheduleTable)
@@ -1282,6 +1420,18 @@ const layer = Layer.effect(
               .returning()
               .get()
               .pipe(Effect.orDie)
+            yield* ScheduleRuns.recordCompleted(db, {
+              scheduleID: row.id,
+              scheduleName: row.name,
+              ownerSessionID: session.id,
+              sessionID: session.id,
+              run: 1,
+              status: "completed",
+              attention: "quiet",
+              summary: seeded.message ?? ScheduleAction.summaryText(input.action),
+              read: true,
+              now,
+            })
             return toInfo(row, seeded.message)
           }
 
@@ -1393,6 +1543,43 @@ const layer = Layer.effect(
         const row = yield* find(id)
         if (row.active_job_id !== null) yield* jobs.cancel(row.active_job_id)
         yield* db.delete(ScheduleTable).where(eq(ScheduleTable.id, id)).run().pipe(Effect.orDie)
+      }),
+      runs: Effect.fn("Schedule.runs")(function* (input) {
+        return yield* ScheduleRuns.listRuns(db, input)
+      }),
+      inbox: Effect.fn("Schedule.inbox")(function* (input) {
+        return yield* ScheduleRuns.listInbox(db, input)
+      }),
+      getRun: Effect.fn("Schedule.getRun")(function* (runID) {
+        const found = yield* ScheduleRuns.getRun(db, runID)
+        if (found === undefined) return yield* new RunNotFoundError({ runID })
+        return found
+      }),
+      markRead: Effect.fn("Schedule.markRead")(function* (runID) {
+        const now = yield* Clock.currentTimeMillis
+        const updated = yield* ScheduleRuns.markRead(db, runID, now)
+        if (updated === undefined) return yield* new RunNotFoundError({ runID })
+        return updated
+      }),
+      reportResult: Effect.fn("Schedule.reportResult")(function* (sessionID, input) {
+        const nextInMs = input.nextIn === undefined ? undefined : yield* duration(input.nextIn)
+        if (nextInMs !== undefined && nextInMs < MIN_CHECK_INTERVAL) {
+          return yield* new InvalidError({ reason: "nextIn must be at least 15 seconds" })
+        }
+        const now = yield* Clock.currentTimeMillis
+        const reported = yield* ScheduleRuns.reportResult(db, {
+          sessionID,
+          attention: input.attention,
+          summary: input.summary,
+          nextInMs,
+          now,
+        })
+        if (reported === undefined) {
+          return yield* new InvalidError({
+            reason: "schedule_result can only be called during an active scheduled run",
+          })
+        }
+        return reported
       }),
       enabled: Effect.fn("Schedule.enabled")(function* (sessionID) {
         const session = yield* sessions.get(sessionID)
